@@ -149,20 +149,46 @@ async def filter_chosen(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 async def send_results(message, context: ContextTypes.DEFAULT_TYPE) -> None:
     niche = context.user_data.get("niche", "")
     city = context.user_data.get("city", "")
-    page = context.user_data.get("page", 1)
+    start_page = context.user_data.get("page", 1)
     has_site = context.user_data.get("has_site")
     user_id = context.user_data.get("user_id")
 
-    places, total, warnings, before_dedup = search_all(
-        niche,
-        city,
-        GIS_API_KEY,
-        YANDEX_API_KEY,
-        page=page,
-        has_site=has_site,
-        require_contact=REQUIRE_CONTACT,
-        user_id=user_id,
-    )
+    filter_label = " без сайта" if has_site is False else ""
+    contact_label = " с контактами" if REQUIRE_CONTACT else ""
+
+    if start_page > MAX_PAGE:
+        await message.reply_text(
+            f"Уже прошёлся по всем {MAX_PAGE} страницам по «{niche}, {city}»"
+            f"{filter_label}{contact_label} — новых компаний тут больше нет. "
+            f"Попробуйте другой город/нишу или /reset."
+        )
+        return
+
+    places: list = []
+    total = 0
+    warnings: list[str] = []
+    any_content_ever = False  # были ли вообще результаты хоть на одной просмотренной странице
+    used_page = start_page
+
+    # Пролистываем страницы 1..MAX_PAGE сами, пока не найдём непоказанные
+    # компании — пользователю не нужно вручную жать "Показать ещё" ради
+    # страницы, которая целиком уже была показана раньше.
+    for p in range(start_page, MAX_PAGE + 1):
+        places, total, warnings, before_dedup = search_all(
+            niche,
+            city,
+            GIS_API_KEY,
+            YANDEX_API_KEY,
+            page=p,
+            has_site=has_site,
+            require_contact=REQUIRE_CONTACT,
+            user_id=user_id,
+        )
+        used_page = p
+        if before_dedup > 0:
+            any_content_ever = True
+        if places:
+            break  # нашли непоказанные — дальше не листаем
 
     for w in warnings:
         await message.reply_text(f"⚠️ {w}")
@@ -172,44 +198,37 @@ async def send_results(message, context: ContextTypes.DEFAULT_TYPE) -> None:
     # страница (дальше идти всё равно некуда, значит сессия завершена).
     session_shown = context.user_data.setdefault("session_shown", [])
     session_shown.extend(places)
-    if user_id is not None and (len(session_shown) >= SESSION_BATCH_SIZE or page >= MAX_PAGE):
+    if user_id is not None and (len(session_shown) >= SESSION_BATCH_SIZE or used_page >= MAX_PAGE):
         _flush_session(context, user_id)
 
-    filter_label = " без сайта" if has_site is False else ""
-    contact_label = " с контактами" if REQUIRE_CONTACT else ""
-
     if not places:
-        if before_dedup > 0:
+        if any_content_ever:
             await message.reply_text(
-                f"На этой странице по «{niche}, {city}»{filter_label}{contact_label} есть "
-                f"{before_dedup} компаний, но все их я вам уже показывал раньше. "
-                f"Нажмите «Показать ещё» или попробуйте /reset, чтобы начать историю заново."
+                f"Прошёлся по всем страницам (до {MAX_PAGE}) по «{niche}, {city}»"
+                f"{filter_label}{contact_label} — новых компаний нет, все уже были "
+                f"показаны раньше. Попробуйте другой город/нишу или /reset, "
+                f"чтобы начать историю заново."
             )
         else:
             await message.reply_text(
-                f"По запросу «{niche}, {city}»{filter_label}{contact_label} ничего не нашлось "
-                f"(страница {page})."
+                f"По запросу «{niche}, {city}»{filter_label}{contact_label} ничего не нашлось."
             )
-        buttons = []
-        if before_dedup > 0 and page < MAX_PAGE:
-            buttons.append(InlineKeyboardButton("Показать ещё ➡️", callback_data="more"))
-        if buttons:
-            await message.reply_text(
-                "Или гляньте следующую страницу:", reply_markup=InlineKeyboardMarkup([buttons])
-            )
+        context.user_data["page"] = used_page + 1
         return
 
     header = (
         f"Нашёл {len(places)} новых организаций{contact_label}{filter_label} "
-        f"по запросу «{niche}, {city}» (страница {page}, всего в источниках ~{total}):\n"
+        f"по запросу «{niche}, {city}» (страница {used_page}, всего в источниках ~{total}):\n"
     )
     await message.reply_text(header)
 
     for place in places:
         await message.reply_text(place.to_text(), parse_mode="HTML", disable_web_page_preview=True)
 
+    context.user_data["page"] = used_page + 1
+
     buttons = []
-    if page < MAX_PAGE:
+    if used_page < MAX_PAGE:
         buttons.append(InlineKeyboardButton("Показать ещё ➡️", callback_data="more"))
     if buttons:
         await message.reply_text(
@@ -221,7 +240,8 @@ async def send_results(message, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def more_results(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
     await query.answer()
-    context.user_data["page"] = context.user_data.get("page", 1) + 1
+    # Страницу дальше двигает сам send_results (context.user_data["page"] уже
+    # указывает на следующую непройденную страницу) — здесь просто вызываем его.
     await send_results(query.message, context)
 
 
