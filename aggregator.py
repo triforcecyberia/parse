@@ -6,9 +6,19 @@
   такие карточки этим фильтром отсеиваются автоматически — контакт есть
   только у части результатов из Яндекса. Это не баг, а честное следствие
   того, что 2GIS прячет контакты за платной подпиской.
+
+Про user_id и дедупликацию:
+  Если передан user_id, компании, уже показанные этому Telegram-аккаунту
+  раньше (сохранённые в SQLite, переживают перезапуск бота), отфильтровываются.
+  У разных user_id истории не пересекаются.
+
+  Само сохранение "показано" сюда не входит — теперь оно пакетное и живёт в
+  bot.py (копится в памяти сессии и пишется в базу одним махом раз в 50
+  компаний, а не на каждой странице — см. send_results в bot.py).
 """
 
 import gis_client
+import storage
 import yandex_client
 from models import Place
 
@@ -29,9 +39,12 @@ def search_all(
     page: int = 1,
     has_site: bool | None = None,
     require_contact: bool = False,
-) -> tuple[list[Place], int, list[str]]:
+    user_id: int | None = None,
+) -> tuple[list[Place], int, list[str], int]:
     """
-    Возвращает (отфильтрованный список Place, суммарный total по данным API, список предупреждений).
+    Возвращает (отфильтрованный список Place, суммарный total по данным API,
+    список предупреждений, кол-во результатов до дедупликации по user_id —
+    полезно, чтобы отличить "ничего не нашлось" от "всё это вы уже видели").
     """
     places: list[Place] = []
     total = 0
@@ -67,4 +80,9 @@ def search_all(
     if require_contact:
         places = [p for p in places if p.phone]
 
-    return places, total, warnings
+    before_dedup = len(places)
+
+    if user_id is not None:
+        places = storage.filter_unseen(user_id, places)
+
+    return places, total, warnings, before_dedup
