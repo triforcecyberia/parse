@@ -13,14 +13,18 @@ from pathlib import Path
 DB_PATH = Path(__file__).parent / "seen_companies.db"
 
 
-def _dedup_key(place) -> str:
+def _dedup_key(place, city: str) -> str:
     """
-    Стабильный ключ компании: источник + название + адрес (в нижнем регистре,
-    без пробелов по краям). Не используем id из API, т.к. Яндекс его не
-    гарантирует в ответе — этого набора полей достаточно, чтобы не путать
-    разные компании и при этом узнавать одну и ту же при повторном поиске.
+    Стабильный ключ компании: название + город (без источника и без адреса).
+
+    Без источника — потому что одна и та же сеть может найтись и через 2GIS,
+    и через Яндекс, это всё равно одна компания.
+    Без адреса — потому что разные точки одной сети (см. aggregator.py,
+    _collapse_chains) должны считаться одной и той же компанией.
+    С городом — потому что "Дринкит" в Москве и "Дринкит" в другом городе это
+    по факту разные точки для разных рынков, их не нужно путать между собой.
     """
-    raw = f"{place.source}|{place.name.strip().lower()}|{place.address.strip().lower()}"
+    raw = f"{place.name.strip().lower()}|{city.strip().lower()}"
     return hashlib.sha1(raw.encode("utf-8")).hexdigest()
 
 
@@ -43,11 +47,11 @@ def init_db() -> None:
         conn.commit()
 
 
-def filter_unseen(user_id: int, places: list) -> list:
-    """Возвращает только те places, которых этот user_id ещё не видел."""
+def filter_unseen(user_id: int, places: list, city: str) -> list:
+    """Возвращает только те places (для конкретного города), которых этот user_id ещё не видел."""
     if not places:
         return []
-    keys = [_dedup_key(p) for p in places]
+    keys = [_dedup_key(p, city) for p in places]
     with closing(_connect()) as conn:
         placeholders = ",".join("?" for _ in keys)
         rows = conn.execute(
@@ -59,14 +63,14 @@ def filter_unseen(user_id: int, places: list) -> list:
     return [p for p, k in zip(places, keys) if k not in seen_keys]
 
 
-def mark_seen(user_id: int, places: list) -> None:
-    """Запоминает, что эти places уже показаны этому user_id."""
+def mark_seen(user_id: int, places: list, city: str) -> None:
+    """Запоминает, что эти places (для конкретного города) уже показаны этому user_id."""
     if not places:
         return
     with closing(_connect()) as conn:
         conn.executemany(
             "INSERT OR IGNORE INTO seen_companies (user_id, company_key) VALUES (?, ?)",
-            [(user_id, _dedup_key(p)) for p in places],
+            [(user_id, _dedup_key(p, city)) for p in places],
         )
         conn.commit()
 
