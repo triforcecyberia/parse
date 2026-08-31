@@ -22,11 +22,13 @@ Telegram-бот для поиска организаций по нише и го
   3. python bot.py
 """
 
+import asyncio
 import logging
 import os
 
 from dotenv import load_dotenv
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+from telegram.error import RetryAfter, TimedOut
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -52,12 +54,34 @@ YANDEX_API_KEY = os.environ.get("YANDEX_API_KEY", "")
 # снова заработает как задумано.
 REQUIRE_CONTACT = False
 
+# При большом количестве найденных компаний (сейчас это реально сотня+,
+# спасибо OSM) слать по одному сообщению на компанию — плохая идея: Telegram
+# не успевает обрабатывать десятки запросов подряд без пауз и рвёт соединение
+# по таймауту, а дальше отправка просто падает и часть результатов теряется.
+# Группируем по несколько штук в одно сообщение.
+PLACES_PER_MESSAGE = 8
+
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s", level=logging.INFO
 )
 logger = logging.getLogger(__name__)
 
 NICHE, CITY = range(2)
+
+
+async def _send_with_retry(message, text: str, retries: int = 2) -> None:
+    """reply_text с повторной попыткой при временных сбоях сети/таймаутах Telegram."""
+    for attempt in range(retries + 1):
+        try:
+            await message.reply_text(text, parse_mode="HTML", disable_web_page_preview=True)
+            return
+        except RetryAfter as e:
+            await asyncio.sleep(e.retry_after + 0.5)
+        except TimedOut:
+            if attempt == retries:
+                logger.warning("Не удалось отправить сообщение после %d попыток, пропускаю", retries + 1)
+                return
+            await asyncio.sleep(1.5)
 
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -178,8 +202,12 @@ async def run_search(message, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
     await message.reply_text(header)
 
-    for place in places:
-        await message.reply_text(place.to_text(), parse_mode="HTML", disable_web_page_preview=True)
+    separator = "\n\n➖➖➖\n\n"
+    for i in range(0, len(places), PLACES_PER_MESSAGE):
+        chunk = places[i : i + PLACES_PER_MESSAGE]
+        chunk_text = separator.join(p.to_text() for p in chunk)
+        await _send_with_retry(message, chunk_text)
+        await asyncio.sleep(0.3)  # небольшая пауза, чтобы не долбить Telegram без остановки
 
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
