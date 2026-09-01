@@ -7,13 +7,22 @@
 (Overpass API) ищет по тегам или по названию — здесь просто объединяем то,
 что они вернули, схлопываем сетевые точки одной компании, применяем фильтры
 и сверяем с историей показанных.
+
+ВРЕМЕННО: подробное логирование каждого источника + OSM вызывается первым
+(было последним) — отлаживаем расхождение между прямым тестом (работает) и
+живым ботом (OSM почему-то не долетает). Уберём/причешем после того, как
+найдём причину.
 """
+
+import logging
 
 import gis_client
 import osm_client
 import storage
 import yandex_client
 from models import Place
+
+logger = logging.getLogger(__name__)
 
 
 def _collapse_chains(places: list[Place]) -> list[Place]:
@@ -64,37 +73,52 @@ def search_new(
     total = 0
     warnings: list[str] = []
 
+    logger.info("=== search_new старт: niche=%r city=%r has_site=%r user_id=%r ===",
+                niche, city, has_site, user_id)
+
+    # OSM/Overpass — без ключа, всегда пробуем. Поставлен ПЕРВЫМ (диагностика).
+    logger.info("Вызываю OSM...")
+    try:
+        osm_places, osm_total = osm_client.search_places_all(niche, city)
+        all_candidates.extend(osm_places)
+        total += osm_total
+        logger.info("OSM успешно вернул %d мест (total=%d)", len(osm_places), osm_total)
+    except Exception as e:  # временно широкий except, чтобы увидеть ЛЮБУЮ ошибку
+        logger.exception("OSM упал с исключением типа %s", type(e).__name__)
+        warnings.append(f"OSM: {e}")
+
     if gis_api_key:
+        logger.info("Вызываю 2GIS...")
         try:
             gis_places, gis_total = gis_client.search_places_all(
                 niche, city, gis_api_key, has_site=has_site
             )
             all_candidates.extend(gis_places)
             total += gis_total
-        except gis_client.GisApiError as e:
+            logger.info("2GIS успешно вернул %d мест (total=%d)", len(gis_places), gis_total)
+        except Exception as e:
+            logger.exception("2GIS упал с исключением типа %s", type(e).__name__)
             warnings.append(f"2GIS: {e}")
     else:
         warnings.append("2GIS: не настроен (нет GIS_API_KEY)")
 
     if yandex_api_key:
+        logger.info("Вызываю Яндекс...")
         try:
             ya_places, ya_total = yandex_client.search_places_all(niche, city, yandex_api_key)
             all_candidates.extend(ya_places)
             total += ya_total
-        except yandex_client.YandexApiError as e:
+            logger.info("Яндекс успешно вернул %d мест (total=%d)", len(ya_places), ya_total)
+        except Exception as e:
+            logger.exception("Яндекс упал с исключением типа %s", type(e).__name__)
             warnings.append(f"Яндекс: {e}")
     else:
         warnings.append("Яндекс: не настроен (нет YANDEX_API_KEY)")
 
-    # OSM/Overpass — без ключа, всегда пробуем.
-    try:
-        osm_places, osm_total = osm_client.search_places_all(niche, city)
-        all_candidates.extend(osm_places)
-        total += osm_total
-    except osm_client.OsmApiError as e:
-        warnings.append(f"OSM: {e}")
+    logger.info("Всего кандидатов до схлопывания сетей: %d", len(all_candidates))
 
     all_candidates = _collapse_chains(all_candidates)
+    logger.info("После схлопывания сетей: %d", len(all_candidates))
 
     if has_site is False:
         # 2GIS уже отфильтрован на уровне запроса (has_site=false в API).
@@ -104,15 +128,20 @@ def search_new(
             p for p in all_candidates
             if not (p.source in ("Яндекс", "OSM") and p.has_site)
         ]
+        logger.info("После фильтра has_site=False: %d", len(all_candidates))
 
     if require_contact:
         all_candidates = [p for p in all_candidates if p.phone or p.whatsapp or p.telegram]
+        logger.info("После фильтра require_contact: %d", len(all_candidates))
 
     before_dedup = len(all_candidates)
 
     if user_id is not None:
         new_places = storage.filter_unseen(user_id, all_candidates, city)
+        logger.info("После дедупликации по истории (user_id=%s): %d", user_id, len(new_places))
     else:
         new_places = all_candidates
+
+    logger.info("=== search_new конец: итого новых мест = %d ===", len(new_places))
 
     return new_places, total, warnings, before_dedup
